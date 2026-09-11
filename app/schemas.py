@@ -27,15 +27,25 @@ class CreateResponseRequest(BaseModel):
     reasoning: ReasoningParam | None = None
 
 
-def build_dummy_response(request: CreateResponseRequest, model: str) -> dict[str, Any]:
+def build_response(request: CreateResponseRequest, model: str, llm_response: dict[str, Any]) -> dict[str, Any]:
+    """Arma el ResponseResource real a partir de la respuesta del LLM (paso 8).
+
+    `llm_response` es el dict crudo devuelto por `client.converse(...)` de
+    Bedrock (ver app/llm.py): `output.message.content[].text`, `stopReason`,
+    `usage.inputTokens`/`outputTokens`."""
     now = int(time.time())
+    content_parts = llm_response["output"]["message"]["content"]
+    text = "".join(part.get("text", "") for part in content_parts)
+    is_truncated = llm_response.get("stopReason") == "max_tokens"
+    usage = llm_response.get("usage", {})
+
     return {
         "id": f"resp_{uuid.uuid4().hex}",
         "object": "response",
         "created_at": now,
         "completed_at": now,
-        "status": "completed",
-        "incomplete_details": None,
+        "status": "incomplete" if is_truncated else "completed",
+        "incomplete_details": {"reason": "max_output_tokens"} if is_truncated else None,
         "model": model,
         "previous_response_id": None,
         "instructions": request.instructions,
@@ -43,15 +53,12 @@ def build_dummy_response(request: CreateResponseRequest, model: str) -> dict[str
             {
                 "id": f"msg_{uuid.uuid4().hex}",
                 "type": "message",
-                "status": "completed",
+                "status": "incomplete" if is_truncated else "completed",
                 "role": "assistant",
                 "content": [
                     {
                         "type": "output_text",
-                        "text": (
-                            "Este es un esqueleto del endpoint /responses (paso 2 del "
-                            "roadmap). Todavia no hay un LLM conectado."
-                        ),
+                        "text": text,
                         "annotations": [],
                     }
                 ],
@@ -70,7 +77,13 @@ def build_dummy_response(request: CreateResponseRequest, model: str) -> dict[str
         "temperature": request.temperature,
         "reasoning": None,
         "user": None,
-        "usage": None,
+        "usage": {
+            "input_tokens": usage.get("inputTokens", 0),
+            "output_tokens": usage.get("outputTokens", 0),
+            "total_tokens": usage.get("inputTokens", 0) + usage.get("outputTokens", 0),
+            "input_tokens_details": {"cached_tokens": usage.get("cacheReadInputTokens", 0) or 0},
+            "output_tokens_details": {"reasoning_tokens": 0},
+        },
         "max_output_tokens": request.max_output_tokens,
         "max_tool_calls": None,
         "store": False,
