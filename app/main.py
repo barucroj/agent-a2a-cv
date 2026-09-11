@@ -1,6 +1,6 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 
-from app.config import AGENT_MODEL, API_VERSION_PREFIX, PUBLIC_BASE_URL
+from app.config import AGENT_MODEL, API_VERSION_PREFIX
 from app.schemas import CreateResponseRequest, build_agent_card, build_dummy_response
 
 app = FastAPI(title="Agent CV")
@@ -32,5 +32,12 @@ def create_response(request: CreateResponseRequest) -> dict:
 
 
 @app.get("/.well-known/agent-card.json")
-def agent_card() -> dict:
-    return build_agent_card(PUBLIC_BASE_URL)
+def agent_card(request: Request) -> dict:
+    # Detras del ALB de ECS Express Mode no controlamos una URL publica fija de
+    # antemano (la genera AWS al crear el servicio) — se deriva del propio
+    # request en vez de una variable de entorno, para no depender de nada
+    # inyectado en el contenedor al momento del deploy.
+    proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+    host = request.headers.get("host", request.url.netloc)
+    public_base_url = f"{proto}://{host}{API_VERSION_PREFIX}"
+    return build_agent_card(public_base_url)
