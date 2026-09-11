@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException
 
-from app.config import AGENT_MODEL, PUBLIC_BASE_URL
+from app.config import AGENT_MODEL, API_VERSION_PREFIX, PUBLIC_BASE_URL
 from app.schemas import CreateResponseRequest, build_agent_card, build_dummy_response
 
 app = FastAPI(title="Agent CV")
@@ -11,7 +11,7 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/responses")
+@app.post(f"{API_VERSION_PREFIX}/responses")
 def create_response(request: CreateResponseRequest) -> dict:
     if request.stream:
         raise HTTPException(
