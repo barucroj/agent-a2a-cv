@@ -1,9 +1,9 @@
 import json
 import logging
 import uuid
-from typing import NoReturn
+from typing import NoReturn, cast
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -67,7 +67,13 @@ limiter = Limiter(key_func=_rate_limit_key)
 app.state.limiter = limiter
 
 
-def _handle_rate_limit_exceeded(request: Request, exc: RateLimitExceeded):
+def _handle_rate_limit_exceeded(request: Request, exc: Exception) -> Response:
+    # Firma con Exception (no RateLimitExceeded) para calzar con el tipo que
+    # espera add_exception_handler; Starlette solo invoca este handler para
+    # excepciones RateLimitExceeded (registrado abajo). cast (no assert: no
+    # se elimina en bytecode optimizado, y aqui es solo para el type checker,
+    # no un chequeo real) en vez de un isinstance/assert redundante.
+    exc = cast(RateLimitExceeded, exc)
     # Log propio con motivo estructurado antes de delegar en la respuesta
     # default de slowapi (mismo formato/headers que ya arma la libreria).
     logger.warning(

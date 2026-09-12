@@ -1,0 +1,37 @@
+name: CD
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Sin OIDC (alcance recortado del paso 11, decision explicita): usa las
+      # access keys de agent-cv-deploy guardadas como secrets del repo. El
+      # despliegue real (terraform apply) sigue siendo manual, este job solo
+      # construye y sube la imagen.
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: ecr-login
+
+      - name: Build y push (tag latest + tag por SHA)
+        env:
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          REPOSITORY: agent-cv
+        run: |
+          SHA_TAG="${GITHUB_SHA::7}"
+          docker build \
+            -t "$REGISTRY/$REPOSITORY:latest" \
+            -t "$REGISTRY/$REPOSITORY:$SHA_TAG" \
+            .
+          docker push "$REGISTRY/$REPOSITORY:latest"
+          docker push "$REGISTRY/$REPOSITORY:$SHA_TAG"

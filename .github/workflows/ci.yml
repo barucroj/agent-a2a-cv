@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [develop]
+
+jobs:
+  lint-type-test-build:
+    runs-on: ubuntu-latest
+    env:
+      # Solo para que app/auth.py no intente llamar a Secrets Manager real al
+      # importarse durante los tests (mismo patron que .env.example).
+      AGENT_BEARER_TOKEN: ci-placeholder-token
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Instalar dependencias
+        run: pip install -r requirements-dev.txt
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Tipado (mypy)
+        run: mypy app tests
+
+      - name: Tests (pytest)
+        run: pytest
+
+      - name: Build de la imagen (sin push)
+        run: docker build -t agent-cv:ci .
