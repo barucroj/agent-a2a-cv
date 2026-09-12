@@ -158,6 +158,45 @@ paso 2 deja de ser aspiracional: el endpoint ahora sí lo exige.
   (era 400 como parche del paso 8; se formalizó el código de estado en este paso) antes
   de invocar el LLM.
 
+## Logging estructurado (paso 10)
+
+Formatter JSON propio (`app/logging_utils.py`, `json.dumps` + un `logging.Formatter` a
+medida) — sin librería externa, mismo criterio de proporcionalidad usado en decisiones
+anteriores del proyecto. Cada línea de log de la app es un objeto JSON con `timestamp`,
+`level`, `logger`, `message`, `request_id`, y cualquier campo extra que agregue el
+código (`rejection_reason`, `status_code`, etc.).
+
+**`request_id` por request:** un middleware (`app/main.py`) usa el header `X-Request-Id`
+del cliente si lo manda, o genera uno nuevo (`uuid4`), lo guarda en un `contextvars` y lo
+devuelve también en la respuesta. Un `logging.Filter` lo inyecta automáticamente en
+**todas** las líneas de esa request (sin pasarlo a mano por cada función) — permite
+seguir el rastro completo de una request específica en CloudWatch Logs Insights.
+
+**Todos los rechazos existentes ya loguean el motivo como campo estructurado**
+(`rejection_reason`), no solo en la respuesta HTTP: los 400 del paso 6 (rol `system`
+falso, `tools`, multimodalidad, `previous_response_id`, tamaño excedido), el 401 del
+paso 9 (token inválido/ausente), y el 429 (rate limit — se agregó un exception handler
+propio que loguea antes de delegar en la respuesta default de `slowapi`).
+
+**Decisión abierta resuelta: sí se loguea `input`/`instructions` completos** (no solo
+metadata). La decisión del paso 6/8 de *no* loguear contenido crudo se tomó cuando el
+endpoint era público sin ninguna autenticación — cualquiera en internet podía llenar
+CloudWatch de contenido arbitrario/de terceros. Con el paso 9 ya en producción (auth
+Bearer + rate limiting), esa condición cambió: solo quien tiene el token real puede
+llegar al endpoint. Se prioriza el poder auditar después qué se le mandó exactamente al
+agente (incluyendo intentos de prompt injection reales, no solo su categoría) sobre el
+riesgo residual, ya acotado, de que un llamador autenticado incluya contenido sensible.
+Se mantiene un truncado de 4,000 caracteres por campo — por seguridad operativa (no
+dejar que un solo request genere un evento de log desproporcionado), no por privacidad.
+**Nunca se loguea** el header `Authorization` ni el token (válido o inválido) en ningún
+caso — verificado manualmente (sin rastro en los logs tras probar con un token de prueba)
+y documentado como punto específico para la revisión de Codex.
+
+**Pendiente:** `/codex:review` de este módulo no se pudo correr — el plugin agotó su
+cuota de uso (disponible de nuevo el 10 de octubre). Se verificó manualmente en su lugar:
+ausencia de secretos en los logs (grep), y validez del JSON en las rutas de éxito, 400,
+401 y 429. Correr el review real cuando la cuota se restablezca.
+
 ## Limitaciones conocidas
 
 - **Cómputo: ECS Express Mode, no App Runner.** El plan original de este proyecto era

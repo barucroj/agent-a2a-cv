@@ -1,5 +1,6 @@
 import json
 import logging
+import uuid
 from typing import NoReturn
 
 from fastapi import FastAPI, HTTPException, Request
@@ -11,12 +12,30 @@ from app.auth import is_valid_bearer_token
 from app.config import AGENT_MODEL, API_VERSION_PREFIX
 from app.context import build_messages
 from app.llm import LLMError, generate_reply
+from app.logging_utils import configure_logging, request_id_var
 from app.schemas import CreateResponseRequest, build_agent_card, build_response
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+configure_logging()
 logger = logging.getLogger("agent_cv")
 
 app = FastAPI(title="Agent CV")
+
+
+@app.middleware("http")
+async def add_request_id(request: Request, call_next):
+    # Usa X-Request-Id del cliente si lo manda (permite correlacionar con sus
+    # propios logs), o genera uno nuevo. Se propaga automaticamente a TODAS
+    # las lineas de log de esta request via request_id_var + RequestIdFilter
+    # (app/logging_utils.py), sin pasarlo a mano por cada funcion.
+    incoming_id = request.headers.get("x-request-id")
+    request_id = incoming_id if incoming_id else uuid.uuid4().hex
+    token = request_id_var.set(request_id)
+    try:
+        response = await call_next(request)
+    finally:
+        request_id_var.reset(token)
+    response.headers["X-Request-Id"] = request_id
+    return response
 
 # CORS mas restrictivo posible: la plataforma externa consume /v1/responses
 # server-to-server (backend a backend), nunca desde JavaScript en un
@@ -46,7 +65,19 @@ def _rate_limit_key(request: Request) -> str:
 # horizontalmente hace falta un storage_uri compartido (ej. Redis).
 limiter = Limiter(key_func=_rate_limit_key)
 app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+def _handle_rate_limit_exceeded(request: Request, exc: RateLimitExceeded):
+    # Log propio con motivo estructurado antes de delegar en la respuesta
+    # default de slowapi (mismo formato/headers que ya arma la libreria).
+    logger.warning(
+        "Solicitud rechazada por rate limit",
+        extra={"rejection_reason": "rate_limit_exceeded", "status_code": 429},
+    )
+    return _rate_limit_exceeded_handler(request, exc)
+
+
+app.add_exception_handler(RateLimitExceeded, _handle_rate_limit_exceeded)
 
 # Tipos de contenido de texto permitidos por rol (allowlist, no denylist —
 # ver schema real de openresponses/openresponses verificado en el paso 6):
@@ -81,27 +112,42 @@ def _input_char_length(input_value: object) -> int:
     return 0
 
 
-def _request_metadata(instructions: str | None, input_value: object) -> str:
-    # Nunca se loguea el contenido crudo de instructions/input (ni siquiera en
-    # rechazos): un payload rechazado es justo el mas propenso a traer texto
-    # inesperado/sensible de terceros (hallazgo de Codex, adversarial review
-    # del paso 6). El motivo del rechazo ya es suficiente evidencia de que
-    # alguien lo intento.
-    return (
-        f"instructions_presente={instructions is not None} "
-        f"instructions_len={len(instructions) if instructions else 0} "
-        f"input_type={type(input_value).__name__} "
-        f"input_len={len(input_value) if isinstance(input_value, (str, list)) else 0}"
-    )
+# Paso 10: se loguea instructions/input completos (Opcion A, aprobada
+# explicitamente) -- el endpoint ya no es publico sin control (paso 9: auth
+# Bearer + rate limiting), asi que el riesgo que motivo "solo metadata" en el
+# paso 6/8 (cualquiera en internet podia llenar los logs de basura/datos de
+# terceros) ya no aplica igual. Se mantiene un truncado por seguridad (no por
+# privacidad): un solo request no debe poder generar un evento de log
+# desproporcionadamente grande.
+_LOG_CONTENT_MAX_CHARS = 4000
+
+
+def _stringify_for_log(value: object) -> str:
+    if value is None:
+        return ""
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+    if len(text) > _LOG_CONTENT_MAX_CHARS:
+        return text[:_LOG_CONTENT_MAX_CHARS] + f"...<truncado, {len(text)} chars totales>"
+    return text
+
+
+def _request_log_fields(instructions: str | None, input_value: object) -> dict[str, str]:
+    return {
+        "instructions": _stringify_for_log(instructions),
+        "input": _stringify_for_log(input_value),
+    }
 
 
 def _reject(
     reason: str, *, instructions: str | None, input_value: object, status_code: int = 400
 ) -> NoReturn:
     logger.warning(
-        "Solicitud a /responses rechazada: %s — %s",
-        reason,
-        _request_metadata(instructions, input_value),
+        "Solicitud a /responses rechazada",
+        extra={
+            "rejection_reason": reason,
+            "status_code": status_code,
+            **_request_log_fields(instructions, input_value),
+        },
     )
     raise HTTPException(status_code=status_code, detail=reason)
 
@@ -155,14 +201,19 @@ def health() -> dict[str, str]:
 @limiter.limit("20/minute")
 def create_response(request: Request, body: CreateResponseRequest) -> dict:
     # Auth Bearer real, antes de cualquier otro trabajo: sin el header
-    # correcto, 401 sin tocar el LLM ni el resto de las validaciones.
+    # correcto, 401 sin tocar el LLM ni el resto de las validaciones. Nunca se
+    # loguea el header Authorization ni el token (ni el valido ni el
+    # invalido) -- solo la categoria del rechazo.
     if not is_valid_bearer_token(request.headers.get("authorization")):
-        logger.warning("Solicitud a /responses rechazada: token de autorizacion invalido o ausente.")
+        logger.warning(
+            "Solicitud a /responses rechazada",
+            extra={"rejection_reason": "invalid_or_missing_token", "status_code": 401},
+        )
         raise HTTPException(status_code=401, detail="Token de autorizacion invalido o ausente.")
 
     logger.info(
-        "Request recibido en /responses — %s",
-        _request_metadata(body.instructions, body.input),
+        "Request recibido en /responses",
+        extra=_request_log_fields(body.instructions, body.input),
     )
 
     def reject(reason: str, status_code: int = 400) -> NoReturn:
@@ -211,7 +262,10 @@ def create_response(request: Request, body: CreateResponseRequest) -> dict:
             max_output_tokens=body.max_output_tokens,
         )
     except LLMError as exc:
-        logger.error("Fallo al generar respuesta del LLM: %s", exc)
+        logger.error(
+            "Fallo al generar respuesta del LLM",
+            extra={"status_code": 502, "error": str(exc)},
+        )
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     return build_response(body, model=AGENT_MODEL, llm_response=llm_response)
