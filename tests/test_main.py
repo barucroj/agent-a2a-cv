@@ -1,10 +1,15 @@
+import os
+
 from fastapi.testclient import TestClient
 
 from app.main import app
 
 client = TestClient(app)
 
-AUTH_HEADERS = {"Authorization": "Bearer test-token-for-ci"}
+# Lee el mismo valor que fijo conftest.py (o el que fije el entorno de CI),
+# en vez de un literal duplicado que puede desincronizarse (paso 11: asi
+# fallaron 4 tests en CI porque ci.yml y conftest.py no coincidian).
+AUTH_HEADERS = {"Authorization": f"Bearer {os.environ['AGENT_BEARER_TOKEN']}"}
 
 
 def test_health():

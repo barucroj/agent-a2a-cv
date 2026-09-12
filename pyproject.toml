@@ -2,6 +2,13 @@
 line-length = 110
 target-version = "py313"
 
+[tool.pytest.ini_options]
+# Sin esto, "pytest" invocado directo (no "python -m pytest") no agrega la
+# raiz del repo a sys.path y "from app.main import app" falla con
+# ModuleNotFoundError -- justo lo que paso en CI (localmente se enmascaraba
+# porque las pruebas se corrieron con "python -m pytest", que si lo agrega).
+pythonpath = ["."]
+
 [tool.mypy]
 python_version = "3.13"
 warn_unused_ignores = true
