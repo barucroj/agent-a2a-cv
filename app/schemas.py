@@ -103,7 +103,9 @@ def build_agent_card(public_base_url: str) -> dict[str, Any]:
             "profesional, experiencia, proyectos y habilidades de su titular. Esta "
             "tarjeta se expone unicamente como metadata de descubrimiento para "
             "plataformas compatibles con Open Responses: NO implementa el protocolo "
-            "A2A completo (no declara supportedInterfaces ni endpoints de tareas A2A)."
+            "A2A completo (no expone metodos de tareas A2A como SendMessage/GetTask; "
+            "supportedInterfaces se declara solo para satisfacer el validador de "
+            "tarjetas de agente, con un protocolBinding no estandar)."
         ),
         "version": "0.1.0",
         "capabilities": {
@@ -142,7 +144,22 @@ def build_agent_card(public_base_url: str) -> dict[str, Any]:
             }
         },
         "securityRequirements": [{"schemes": {"bearerAuth": {"list": []}}}],
-        # Campo NO estandar de A2A: aqui vive la URL real de Open Responses,
-        # ya que "supportedInterfaces" es para bindings A2A nativos que no tenemos.
+        # supportedInterfaces es requerido por el spec de A2A (verificado contra
+        # a2a.proto, rama main, v1.0.1) -- confirmado en el paso 13 que la
+        # plataforma externa lo exige para su flujo de "Importar desde tarjeta
+        # de agente" (sin el, el import falla: "falta name o supportedInterfaces").
+        # protocolBinding "OpenResponses" es un valor NO estandar (el spec permite
+        # "string de forma abierta" -- no limitado a JSONRPC/GRPC/HTTP+JSON):
+        # no implementamos metodos A2A reales (SendMessage/GetTask) en esta URL,
+        # asi que declarar HTTP+JSON seria afirmar algo falso. Esto solo satisface
+        # el campo requerido sin mentir sobre que protocolo hay realmente ahi.
+        "supportedInterfaces": [
+            {
+                "url": public_base_url,
+                "protocolBinding": "OpenResponses",
+                "protocolVersion": "1.0",
+            }
+        ],
+        # Campo NO estandar de A2A: aqui vive la URL real de Open Responses.
         "x-openResponsesUrl": f"{public_base_url}/responses",
     }
