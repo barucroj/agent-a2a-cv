@@ -1,0 +1,22 @@
+[tool.ruff]
+line-length = 110
+target-version = "py313"
+
+[tool.pytest.ini_options]
+# Sin esto, "pytest" invocado directo (no "python -m pytest") no agrega la
+# raiz del repo a sys.path y "from app.main import app" falla con
+# ModuleNotFoundError -- justo lo que paso en CI (localmente se enmascaraba
+# porque las pruebas se corrieron con "python -m pytest", que si lo agrega).
+pythonpath = ["."]
+
+[tool.mypy]
+python_version = "3.13"
+warn_unused_ignores = true
+
+# boto3/botocore no publican type stubs propios (py.typed) ni existen stubs
+# oficiales instalados (boto3-stubs es un paquete aparte, no se agrega para
+# no meter una dependencia mas de la necesaria). Ignorar solo estos modulos,
+# no el resto del codigo.
+[[tool.mypy.overrides]]
+module = ["boto3.*", "botocore.*"]
+ignore_missing_imports = true

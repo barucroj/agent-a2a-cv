@@ -29,7 +29,7 @@ def _split_system_and_messages(
     # 'system' al inicio; se extrae aqui y el resto se traduce al formato de
     # contenido de Converse (content: [{"text": ...}]).
     system_parts = [m["content"] for m in messages if m.get("role") == "system"]
-    conversation = [
+    conversation: list[dict[str, object]] = [
         {"role": m["role"], "content": [{"text": m["content"]}]}
         for m in messages
         if m.get("role") != "system"
