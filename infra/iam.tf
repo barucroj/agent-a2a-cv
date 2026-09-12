@@ -18,19 +18,25 @@ locals {
   # destino (sin account id en ese ARN), acotado mediante condicion al
   # profile de arriba. Se reutiliza tal cual para el Task Role y para el
   # usuario de despliegue local (pruebas del paso 8).
+  #
+  # bedrock:InvokeModelWithResponseStream (paso 13, streaming): es la accion
+  # que usa la Converse Stream API, distinta de InvokeModel (Converse no
+  # streaming). Sin ella, ConverseStream falla en runtime con
+  # AccessDeniedException aunque InvokeModel funcione -- se detecto asi en
+  # produccion tras el primer intento de despliegue de streaming.
   bedrock_invoke_policy_json = jsonencode({
     Version = "2012-10-17"
     Statement = [
       {
         Sid      = "InvokeInferenceProfile"
         Effect   = "Allow"
-        Action   = "bedrock:InvokeModel"
+        Action   = ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"]
         Resource = local.bedrock_inference_profile_arn
       },
       {
         Sid    = "InvokeUnderlyingFoundationModel"
         Effect = "Allow"
-        Action = "bedrock:InvokeModel"
+        Action = ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"]
         Resource = [
           for region in local.bedrock_geo_us_regions :
           "arn:aws:bedrock:${region}::foundation-model/${local.bedrock_model_id}"
