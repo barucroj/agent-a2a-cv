@@ -3,9 +3,15 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
 
 # Reporte del set de evaluacion (paso 12): se regenera en cada corrida.
 eval/report.md
+
+# Historial de decisiones/trade-offs: registro interno, no para el repo publico.
+decisions.md
 
 # Terraform (state local, nunca se sube)
 infra/.terraform/
