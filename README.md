@@ -197,6 +197,49 @@ cuota de uso (disponible de nuevo el 10 de octubre). Se verificó manualmente en
 ausencia de secretos en los logs (grep), y validez del JSON en las rutas de éxito, 400,
 401 y 429. Correr el review real cuando la cuota se restablezca.
 
+## CI/CD (paso 11)
+
+**Alcance recortado, decisión explícita** — proporcional al tamaño del proyecto y
+acotado por la pérdida de cuota de Codex (ver abajo). Deliberadamente **no** incluye:
+OIDC (se usan access keys de larga duración en su lugar), gate de aprobación en GitHub
+Environments, ni `terraform plan`/`apply` automatizado. El despliegue real lo sigue
+haciendo el operador a mano, como en todo el proyecto hasta ahora.
+
+**`ci.yml`** — en cada Pull Request hacia `develop`: `ruff` (lint), `mypy` (tipado),
+`pytest` (tests), y `docker build` (sin push, solo confirma que la imagen compila). Corre
+sin supervisión.
+
+**`cd.yml`** — en cada push a `main`: build + push a ECR, con **dos tags por build**
+(`latest` y el SHA corto del commit). Nada más — ni plan ni apply. Autenticación con
+`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` de `agent-cv-deploy` guardadas como secrets
+del repo en GitHub — **trade-off aceptado explícitamente**: OIDC habría sido la opción
+más segura (sin credenciales de larga duración expuestas como secreto), pero se descartó
+por tiempo, dado el alcance recortado de este paso. No hizo falta ningún permiso IAM
+nuevo: `agent-cv-deploy` ya tenía `AmazonEC2ContainerRegistryFullAccess`.
+
+**Hallazgo real de `tfsec` sobre `infra/` — aceptado con mitigación parcial, no
+ignorado:** el repositorio ECR tiene `image_tag_mutability = "MUTABLE"` (severidad HIGH,
+`aws-ecr-enforce-immutable-repository`) — cualquiera con permiso de push podría
+sobrescribir el tag `latest` sin que se note. Pasar a `IMMUTABLE` habría roto el flujo
+actual (Terraform resuelve la imagen por el tag `latest` vía `data "aws_ecr_image"`, que
+depende de poder re-apuntar ese tag en cada build) y habría exigido rediseñar el
+mecanismo de promoción de imágenes — desproporcionado para el alcance de este paso. En
+su lugar, `cd.yml` etiqueta cada build también con el SHA corto del commit (además de
+`latest`), dando trazabilidad real (siempre se puede ver en ECR qué commit generó cada
+imagen histórica) sin cambiar la mutabilidad del repo ni tocar cómo Terraform la resuelve.
+Dos hallazgos LOW adicionales (log group y repo ECR sin KMS customer-managed) se aceptan
+tal cual — mismo criterio que los permisos amplios de `agent-cv-deploy`: la encriptación
+default de AWS ya aplica, una CMK propia es complejidad sin beneficio proporcional aquí.
+
+**Sustitución de Codex por herramientas estáticas (este paso en adelante, mientras dure
+la pérdida de cuota):** `ruff`, `mypy`, `bandit`, `pip-audit` para Python, `tfsec` para
+Terraform. Hallazgo real de `pip-audit`: `starlette` (dependencia transitiva de
+`fastapi==0.128.8`, tope `starlette<1.0.0` en esa versión) tenía 10 CVEs conocidos en la
+versión resuelta (0.52.1) — todas las versiones parchadas son `>=1.0.0`. Se actualizó
+`fastapi` a `0.141.1` (permite `starlette>=0.46.0`, sin tope superior) y se fijó
+`starlette==1.6.0` explícitamente; se verificó que la app y los tests siguen funcionando
+igual tras la actualización antes de comitear.
+
 ## Limitaciones conocidas
 
 - **Cómputo: ECS Express Mode, no App Runner.** El plan original de este proyecto era
