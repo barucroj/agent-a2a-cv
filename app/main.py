@@ -3,7 +3,11 @@ import logging
 from typing import NoReturn
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
 
+from app.auth import is_valid_bearer_token
 from app.config import AGENT_MODEL, API_VERSION_PREFIX
 from app.context import build_messages
 from app.llm import LLMError, generate_reply
@@ -13,6 +17,36 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 logger = logging.getLogger("agent_cv")
 
 app = FastAPI(title="Agent CV")
+
+# CORS mas restrictivo posible: la plataforma externa consume /v1/responses
+# server-to-server (backend a backend), nunca desde JavaScript en un
+# navegador. CORS es un mecanismo que solo aplica el navegador -- un cliente
+# no-navegador ignora estos headers por completo -- asi que allow_origins=[]
+# no afecta el trafico real y bloquea cualquier intento futuro de uso desde
+# un navegador, sin necesidad de whitelisting de origenes.
+app.add_middleware(CORSMiddleware, allow_origins=[])
+
+
+def _rate_limit_key(request: Request) -> str:
+    # El conector real a este contenedor es el ALB de ECS Express Mode, no el
+    # cliente -- request.client.host por si solo seria la IP del ALB para
+    # todos los llamadores. El ALB usa modo "append" (default, verificado
+    # contra la doc oficial): agrega la IP real observada al FINAL de
+    # cualquier X-Forwarded-For que el cliente ya haya mandado. Tomar el
+    # primer valor seria tomar uno que el propio llamador puede inventar y
+    # rotar para evadir el limite; el ultimo es el unico que el ALB controla.
+    forwarded_for = request.headers.get("x-forwarded-for")
+    if forwarded_for:
+        return forwarded_for.split(",")[-1].strip()
+    return request.client.host if request.client else "unknown"
+
+
+# Storage en memoria (default de slowapi): correcto mientras el servicio
+# corra en una sola instancia (desiredCount=1, paso 4); si se escala
+# horizontalmente hace falta un storage_uri compartido (ej. Redis).
+limiter = Limiter(key_func=_rate_limit_key)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # Tipos de contenido de texto permitidos por rol (allowlist, no denylist —
 # ver schema real de openresponses/openresponses verificado en el paso 6):
@@ -61,13 +95,15 @@ def _request_metadata(instructions: str | None, input_value: object) -> str:
     )
 
 
-def _reject(reason: str, *, instructions: str | None, input_value: object) -> NoReturn:
+def _reject(
+    reason: str, *, instructions: str | None, input_value: object, status_code: int = 400
+) -> NoReturn:
     logger.warning(
         "Solicitud a /responses rechazada: %s — %s",
         reason,
         _request_metadata(instructions, input_value),
     )
-    raise HTTPException(status_code=400, detail=reason)
+    raise HTTPException(status_code=status_code, detail=reason)
 
 
 def _validate_input_items(
@@ -116,56 +152,69 @@ def health() -> dict[str, str]:
 
 
 @app.post(f"{API_VERSION_PREFIX}/responses")
-def create_response(request: CreateResponseRequest) -> dict:
+@limiter.limit("20/minute")
+def create_response(request: Request, body: CreateResponseRequest) -> dict:
+    # Auth Bearer real, antes de cualquier otro trabajo: sin el header
+    # correcto, 401 sin tocar el LLM ni el resto de las validaciones.
+    if not is_valid_bearer_token(request.headers.get("authorization")):
+        logger.warning("Solicitud a /responses rechazada: token de autorizacion invalido o ausente.")
+        raise HTTPException(status_code=401, detail="Token de autorizacion invalido o ausente.")
+
     logger.info(
         "Request recibido en /responses — %s",
-        _request_metadata(request.instructions, request.input),
+        _request_metadata(body.instructions, body.input),
     )
 
-    def reject(reason: str) -> NoReturn:
-        _reject(reason, instructions=request.instructions, input_value=request.input)
+    def reject(reason: str, status_code: int = 400) -> NoReturn:
+        _reject(
+            reason,
+            instructions=body.instructions,
+            input_value=body.input,
+            status_code=status_code,
+        )
 
-    total_chars = len(request.instructions or "") + _input_char_length(request.input)
+    total_chars = len(body.instructions or "") + _input_char_length(body.input)
     if total_chars > _MAX_INPUT_CHARS:
         reject(
             "El contenido combinado de 'input' e 'instructions' excede el "
-            f"limite de {_MAX_INPUT_CHARS} caracteres."
+            f"limite de {_MAX_INPUT_CHARS} caracteres.",
+            status_code=413,
         )
     # 'input' es opcional en el schema, pero una conversacion vacia no tiene
     # nada que responder: sin este chequeo, Bedrock la rechaza con un error
     # de validacion que terminaria devolviendose como 502 (como si fuera una
     # falla nuestra) en vez de 400 (error del cliente).
-    if not request.input:
+    if not body.input:
         reject("El campo 'input' es requerido y no puede estar vacio.")
-    if isinstance(request.input, list) and not any(
+    if isinstance(body.input, list) and not any(
         isinstance(item, dict) and item.get("role") == "user" and item.get("content")
-        for item in request.input
+        for item in body.input
     ):
         reject("El 'input' debe incluir al menos un mensaje con rol 'user' y contenido no vacio.")
-    if request.stream:
+    if body.stream:
         reject("Este agente no soporta stream=true.")
-    if request.tools or request.tool_choice is not None:
+    if body.tools or body.tool_choice is not None:
         reject("Este agente no soporta tool calling.")
-    if request.previous_response_id or request.conversation:
+    if body.previous_response_id or body.conversation:
         reject(
             "Este agente es stateless: reenvia el historial completo en 'input'; "
             "no uses previous_response_id ni conversation."
         )
-    _validate_input_items(request.input, instructions=request.instructions)
+    _validate_input_items(body.input, instructions=body.instructions)
 
-    messages = build_messages(request.instructions, request.input)
+    messages = build_messages(body.instructions, body.input)
     try:
         llm_response = generate_reply(
             messages,
-            temperature=request.temperature,
-            top_p=request.top_p,
-            max_output_tokens=request.max_output_tokens,
+            temperature=body.temperature,
+            top_p=body.top_p,
+            max_output_tokens=body.max_output_tokens,
         )
     except LLMError as exc:
         logger.error("Fallo al generar respuesta del LLM: %s", exc)
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-    return build_response(request, model=AGENT_MODEL, llm_response=llm_response)
+    return build_response(body, model=AGENT_MODEL, llm_response=llm_response)
 
 
 @app.get("/.well-known/agent-card.json")
