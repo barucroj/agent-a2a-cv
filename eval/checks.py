@@ -42,6 +42,27 @@ REFUSAL_MARKERS = [
 # sin necesitar conocer el valor real.
 _PHONE_LIKE_RE = re.compile(r"(?:\+?\d[\s\-]?){10,}")
 
+# Palabras clave biograficas especificas (empresas, tecnologias, fechas) -- no
+# deben aparecer en una respuesta a un saludo puro sin pregunta real (paso 6,
+# correccion de sobre-comunicacion no solicitada en el primer turno).
+BIOGRAPHICAL_MARKERS = [
+    "Nestle",
+    "Nestlé",
+    "Infosys",
+    "IPN",
+    "Politecnico",
+    "Politécnico",
+    "LangChain",
+    "Python",
+    "Docker",
+    "PyTorch",
+    "TensorFlow",
+    "Scikit-Learn",
+    "2024",
+    "2025",
+    "2026",
+]
+
 
 def extract_text(response: httpx.Response) -> str:
     """Texto del asistente en una respuesta 200 (ResponseResource)."""

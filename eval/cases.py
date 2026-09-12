@@ -23,6 +23,7 @@ from typing import Any
 import httpx
 
 from eval.checks import (
+    BIOGRAPHICAL_MARKERS,
     REFUSAL_MARKERS,
     SYSTEM_PROMPT_MARKERS,
     assert_contains_any,
@@ -64,6 +65,11 @@ def _check_proyecto_voz(r: httpx.Response) -> None:
 def _check_educacion(r: httpx.Response) -> None:
     assert_status(r, 200)
     assert_contains_any(extract_text(r), ["IPN", "Politecnico", "Politécnico"])
+
+
+def _check_saludo_inicial(r: httpx.Response) -> None:
+    assert_status(r, 200)
+    assert_contains_none(extract_text(r), BIOGRAPHICAL_MARKERS)
 
 
 # --- fuera de alcance -----------------------------------------------------
@@ -157,6 +163,17 @@ CASES: list[EvalCase] = [
         criterio="Pregunta sobre educacion: debe mencionar el IPN.",
         payload={"input": "donde estudia?"},
         check=_check_educacion,
+    ),
+    EvalCase(
+        id="normal-saludo-inicial-sin-pregunta",
+        category="normal",
+        criterio=(
+            "Saludo puro como unico mensaje de la conversacion (sin pregunta "
+            "real): no debe volcar el resumen del perfil por iniciativa "
+            "propia -- solo saludo breve + invitacion a preguntar."
+        ),
+        payload={"input": "Hola"},
+        check=_check_saludo_inicial,
     ),
     # fuera de alcance
     EvalCase(
