@@ -27,23 +27,36 @@ class CreateResponseRequest(BaseModel):
     reasoning: ReasoningParam | None = None
 
 
-def build_response(request: CreateResponseRequest, model: str, llm_response: dict[str, Any]) -> dict[str, Any]:
+def build_response(
+    request: CreateResponseRequest,
+    model: str,
+    llm_response: dict[str, Any],
+    *,
+    response_id: str | None = None,
+    item_id: str | None = None,
+    created_at: int | None = None,
+) -> dict[str, Any]:
     """Arma el ResponseResource real a partir de la respuesta del LLM (paso 8).
 
     `llm_response` es el dict crudo devuelto por `client.converse(...)` de
     Bedrock (ver app/llm.py): `output.message.content[].text`, `stopReason`,
-    `usage.inputTokens`/`outputTokens`."""
-    now = int(time.time())
+    `usage.inputTokens`/`outputTokens`.
+
+    `response_id`/`item_id`/`created_at` son opcionales: sin streaming se
+    generan aqui (como antes); con streaming (paso 13), el generador de
+    eventos en app/main.py los fija una sola vez y los reusa en TODOS los
+    eventos de la misma respuesta, incluido este snapshot final."""
+    now = created_at if created_at is not None else int(time.time())
     content_parts = llm_response["output"]["message"]["content"]
     text = "".join(part.get("text", "") for part in content_parts)
     is_truncated = llm_response.get("stopReason") == "max_tokens"
     usage = llm_response.get("usage", {})
 
     return {
-        "id": f"resp_{uuid.uuid4().hex}",
+        "id": response_id or f"resp_{uuid.uuid4().hex}",
         "object": "response",
         "created_at": now,
-        "completed_at": now,
+        "completed_at": int(time.time()),
         "status": "incomplete" if is_truncated else "completed",
         "incomplete_details": {"reason": "max_output_tokens"} if is_truncated else None,
         "model": model,
@@ -51,7 +64,7 @@ def build_response(request: CreateResponseRequest, model: str, llm_response: dic
         "instructions": request.instructions,
         "output": [
             {
-                "id": f"msg_{uuid.uuid4().hex}",
+                "id": item_id or f"msg_{uuid.uuid4().hex}",
                 "type": "message",
                 "status": "incomplete" if is_truncated else "completed",
                 "role": "assistant",
@@ -95,6 +108,48 @@ def build_response(request: CreateResponseRequest, model: str, llm_response: dic
     }
 
 
+def build_streaming_skeleton(
+    request: CreateResponseRequest, model: str, *, response_id: str, created_at: int
+) -> dict[str, Any]:
+    """Snapshot inicial (status "in_progress", sin output) para los eventos
+    `response.created`/`response.in_progress` (paso 13). Mismos campos que
+    build_response, antes de que exista una respuesta real del LLM."""
+    return {
+        "id": response_id,
+        "object": "response",
+        "created_at": created_at,
+        "completed_at": None,
+        "status": "in_progress",
+        "incomplete_details": None,
+        "model": model,
+        "previous_response_id": None,
+        "instructions": request.instructions,
+        "output": [],
+        "error": None,
+        "tools": [],
+        "tool_choice": "none",
+        "truncation": "disabled",
+        "parallel_tool_calls": False,
+        "text": {"format": {"type": "text"}, "verbosity": "medium"},
+        "top_p": request.top_p,
+        "presence_penalty": None,
+        "frequency_penalty": None,
+        "top_logprobs": None,
+        "temperature": request.temperature,
+        "reasoning": None,
+        "user": None,
+        "usage": None,
+        "max_output_tokens": request.max_output_tokens,
+        "max_tool_calls": None,
+        "store": False,
+        "background": False,
+        "service_tier": "auto",
+        "metadata": None,
+        "safety_identifier": None,
+        "prompt_cache_key": None,
+    }
+
+
 def build_agent_card(public_base_url: str) -> dict[str, Any]:
     return {
         "name": "Agent CV",
@@ -109,7 +164,7 @@ def build_agent_card(public_base_url: str) -> dict[str, Any]:
         ),
         "version": "0.1.0",
         "capabilities": {
-            "streaming": False,
+            "streaming": True,
             "pushNotifications": False,
         },
         "defaultInputModes": ["text/plain"],

@@ -1,3 +1,4 @@
+import json
 import os
 
 from fastapi.testclient import TestClient
@@ -65,3 +66,59 @@ def test_responses_success(monkeypatch):
     assert body["output"][0]["content"][0]["text"] == "hola, soy el agente"
     assert body["usage"]["input_tokens"] == 10
     assert body["usage"]["output_tokens"] == 5
+
+
+def test_responses_stream_true_returns_sse_sequence(monkeypatch):
+    # La plataforma externa manda stream=true por default (paso 13); antes de
+    # esto el endpoint lo rechazaba con 400 y rompia la integracion real.
+    fake_bedrock_events = [
+        {"messageStart": {"role": "assistant"}},
+        {"contentBlockDelta": {"delta": {"text": "hola, "}, "contentBlockIndex": 0}},
+        {"contentBlockDelta": {"delta": {"text": "soy el agente"}, "contentBlockIndex": 0}},
+        {"contentBlockStop": {"contentBlockIndex": 0}},
+        {"messageStop": {"stopReason": "end_turn"}},
+        {"metadata": {"usage": {"inputTokens": 10, "outputTokens": 5}}},
+    ]
+
+    def fake_generate_reply_stream(messages, **kwargs):
+        yield from fake_bedrock_events
+
+    monkeypatch.setattr("app.main.generate_reply_stream", fake_generate_reply_stream)
+
+    resp = client.post(
+        "/v1/responses", json={"input": "hola", "stream": True}, headers=AUTH_HEADERS
+    )
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/event-stream")
+
+    events = [
+        json.loads(line[len("data: ") :])
+        for line in resp.text.split("\n\n")
+        if line.startswith("data: ")
+    ]
+    event_types = [e["type"] for e in events]
+    assert event_types == [
+        "response.created",
+        "response.in_progress",
+        "response.output_item.added",
+        "response.content_part.added",
+        "response.output_text.delta",
+        "response.output_text.delta",
+        "response.output_text.done",
+        "response.content_part.done",
+        "response.output_item.done",
+        "response.completed",
+    ]
+
+    deltas = [e["delta"] for e in events if e["type"] == "response.output_text.delta"]
+    assert "".join(deltas) == "hola, soy el agente"
+
+    final = events[-1]["response"]
+    assert final["status"] == "completed"
+    assert final["output"][0]["content"][0]["text"] == "hola, soy el agente"
+    assert final["usage"]["input_tokens"] == 10
+    assert final["usage"]["output_tokens"] == 5
+
+    # Todos los eventos comparten el mismo response_id/item_id.
+    response_ids = {e["response"]["id"] for e in events if "response" in e}
+    assert len(response_ids) == 1
