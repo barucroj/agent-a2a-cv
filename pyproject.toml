@@ -8,6 +8,10 @@ target-version = "py313"
 # ModuleNotFoundError -- justo lo que paso en CI (localmente se enmascaraba
 # porque las pruebas se corrieron con "python -m pytest", que si lo agrega).
 pythonpath = ["."]
+# "pytest" sin argumentos (CI) solo corre tests/ (unitarias, TestClient +
+# LLM mockeado). eval/ (paso 12) pega contra un servidor real (local o
+# produccion) y se invoca explicitamente: "pytest eval/".
+testpaths = ["tests"]
 
 [tool.mypy]
 python_version = "3.13"

@@ -4,6 +4,9 @@ __pycache__/
 .venv/
 venv/
 
+# Reporte del set de evaluacion (paso 12): se regenera en cada corrida.
+eval/report.md
+
 # Terraform (state local, nunca se sube)
 infra/.terraform/
 infra/*.tfstate

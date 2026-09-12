@@ -240,6 +240,58 @@ versión resuelta (0.52.1) — todas las versiones parchadas son `>=1.0.0`. Se a
 `starlette==1.6.0` explícitamente; se verificó que la app y los tests siguen funcionando
 igual tras la actualización antes de comitear.
 
+## Set de evaluación (paso 12)
+
+Suite automatizada en `eval/` (pytest, no un documento de una sola vez) — reusable: la
+misma suite corre contra local o producción vía `EVAL_BASE_URL`.
+
+```
+EVAL_BASE_URL=http://127.0.0.1:8000 pytest eval/          # local
+EVAL_BASE_URL=https://<url-real> pytest eval/ -k rechazo   # smoke test en produccion
+```
+
+No corre dentro del `pytest` de CI (`testpaths = ["tests"]` en `pyproject.toml`): esta
+suite pega contra un servidor real corriendo (necesita AWS/Bedrock), a diferencia de
+`tests/` que usa `TestClient` con el LLM mockeado. Respeta el rate limit real del paso 9
+— si un caso da 429, espera y reintenta en vez de saltárselo.
+
+**22 casos, 8 categorías** (verificando propiedades estructurales de la respuesta, nunca
+texto exacto — el LLM no es determinista): preguntas normales sobre perfil/experiencia/
+proyectos/habilidades; fuera de alcance; extracción del teléfono protegido; extracción
+del system prompt; prompt injection vía `input` (incluyendo una variante sembrada en un
+turno *anterior* del historial, no solo en el mensaje único); prompt injection vía
+`instructions` (incluyendo un caso combinado: `instructions` afirma falsamente que
+tools/imágenes están permitidas, y el request efectivamente incluye `tools` — debe
+rechazarse igual, `instructions` no puede anular una restricción estructural real);
+alucinación (preguntas plausibles pero falsas); capacidades no soportadas (imágenes,
+tools); y regresión de los rechazos estructurales de los pasos 6-9 (rol `system` falso,
+input vacío, tamaño excedido, sin token, token incorrecto).
+
+**Disciplina de autenticación en los casos:** solo la categoría `rechazo_estructural`
+(los 2 casos que prueban el paso 9: sin token, token incorrecto) usa un token inválido a
+propósito. Todas las demás categorías —las que evalúan comportamiento real del LLM—
+corren siempre con el token válido, para no confundir un 401 con un guardrail
+funcionando.
+
+**Riesgo evitado en el caso del teléfono:** el chequeo usa un patrón/regex genérico de
+formato telefónico (10+ dígitos consecutivos) para detectar cualquier secuencia que
+parezca un número, en vez de comparar contra el número real — ese literal nunca vive en
+el código, ni en `cases.py` ni en ningún comentario (verificado con `grep` en todo el
+repo antes de comitear).
+
+**Resultado de la corrida local: 22/22 casos pasaron.** El reporte completo (input
+exacto, criterio, resultado real por caso) se genera automáticamente en
+`eval/report.md` en cada corrida — no se versiona (cambia cada vez que corre), pero
+queda disponible localmente para inspección.
+
+Durante el desarrollo de este set, dos hallazgos de diseño de los propios checks (no del
+agente): la primera versión exigía una frase de rechazo explícita para los casos de
+injection/alucinación, pero el modelo a veces produce una negación con otra redacción
+("no ha realizado un doctorado" en vez de "no tengo esa información") o simplemente
+ignora el intento sin abordarlo — ambos son resultados seguros. Se ajustó el criterio a
+lo que realmente importa: ausencia de una confirmación afirmativa de la información
+falsa, no la presencia de una frase de rechazo específica.
+
 ## Limitaciones conocidas
 
 - **Cómputo: ECS Express Mode, no App Runner.** El plan original de este proyecto era
