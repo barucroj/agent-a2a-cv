@@ -1,19 +1,27 @@
 import json
 import logging
+import time
 import uuid
-from typing import NoReturn, cast
+from collections.abc import Generator
+from typing import Any, NoReturn, cast
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 
 from app.auth import is_valid_bearer_token
 from app.config import AGENT_MODEL, API_VERSION_PREFIX
 from app.context import build_messages
-from app.llm import LLMError, generate_reply
+from app.llm import LLMError, generate_reply, generate_reply_stream
 from app.logging_utils import configure_logging, request_id_var
-from app.schemas import CreateResponseRequest, build_agent_card, build_response
+from app.schemas import (
+    CreateResponseRequest,
+    build_agent_card,
+    build_response,
+    build_streaming_skeleton,
+)
 
 configure_logging()
 logger = logging.getLogger("agent_cv")
@@ -198,14 +206,165 @@ def _validate_input_items(
                     )
 
 
+def _sse(event: dict[str, Any]) -> str:
+    return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+
+def _stream_response(
+    body: CreateResponseRequest, messages: list[dict[str, str]]
+) -> Generator[str]:
+    # Traduce los eventos crudos de Bedrock ConverseStream (app/llm.py) a la
+    # secuencia de eventos de streaming de Open Responses (paso 13, verificado
+    # contra schema/components/schemas/Response*StreamingEvent.json del spec).
+    # response_id/item_id/created_at se fijan UNA sola vez y se reusan en
+    # todos los eventos de esta misma respuesta.
+    response_id = f"resp_{uuid.uuid4().hex}"
+    item_id = f"msg_{uuid.uuid4().hex}"
+    created_at = int(time.time())
+
+    seq = 0
+
+    def next_seq() -> int:
+        nonlocal seq
+        seq += 1
+        return seq
+
+    skeleton = build_streaming_skeleton(body, AGENT_MODEL, response_id=response_id, created_at=created_at)
+
+    yield _sse({"type": "response.created", "sequence_number": next_seq(), "response": skeleton})
+    yield _sse({"type": "response.in_progress", "sequence_number": next_seq(), "response": skeleton})
+
+    in_progress_item = {
+        "id": item_id,
+        "type": "message",
+        "status": "in_progress",
+        "role": "assistant",
+        "content": [],
+    }
+    yield _sse(
+        {
+            "type": "response.output_item.added",
+            "sequence_number": next_seq(),
+            "output_index": 0,
+            "item": in_progress_item,
+        }
+    )
+    yield _sse(
+        {
+            "type": "response.content_part.added",
+            "sequence_number": next_seq(),
+            "item_id": item_id,
+            "output_index": 0,
+            "content_index": 0,
+            "part": {"type": "output_text", "text": "", "annotations": []},
+        }
+    )
+
+    accumulated_text = ""
+    stop_reason: str | None = None
+    usage: dict[str, Any] = {}
+
+    try:
+        for event in generate_reply_stream(
+            messages,
+            temperature=body.temperature,
+            top_p=body.top_p,
+            max_output_tokens=body.max_output_tokens,
+        ):
+            if "contentBlockDelta" in event:
+                delta_text = event["contentBlockDelta"].get("delta", {}).get("text")
+                if delta_text:
+                    accumulated_text += delta_text
+                    yield _sse(
+                        {
+                            "type": "response.output_text.delta",
+                            "sequence_number": next_seq(),
+                            "item_id": item_id,
+                            "output_index": 0,
+                            "content_index": 0,
+                            "delta": delta_text,
+                        }
+                    )
+            elif "messageStop" in event:
+                stop_reason = event["messageStop"].get("stopReason")
+            elif "metadata" in event:
+                usage = event["metadata"].get("usage", {})
+    except LLMError as exc:
+        logger.error(
+            "Fallo al generar respuesta del LLM (stream)",
+            extra={"status_code": 502, "error": str(exc)},
+        )
+        failed_response = {**skeleton, "status": "failed", "error": {"message": str(exc)}}
+        yield _sse(
+            {"type": "response.failed", "sequence_number": next_seq(), "response": failed_response}
+        )
+        return
+
+    yield _sse(
+        {
+            "type": "response.output_text.done",
+            "sequence_number": next_seq(),
+            "item_id": item_id,
+            "output_index": 0,
+            "content_index": 0,
+            "text": accumulated_text,
+        }
+    )
+    yield _sse(
+        {
+            "type": "response.content_part.done",
+            "sequence_number": next_seq(),
+            "item_id": item_id,
+            "output_index": 0,
+            "content_index": 0,
+            "part": {"type": "output_text", "text": accumulated_text, "annotations": []},
+        }
+    )
+
+    is_truncated = stop_reason == "max_tokens"
+    final_item = {
+        "id": item_id,
+        "type": "message",
+        "status": "incomplete" if is_truncated else "completed",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": accumulated_text, "annotations": []}],
+    }
+    yield _sse(
+        {
+            "type": "response.output_item.done",
+            "sequence_number": next_seq(),
+            "output_index": 0,
+            "item": final_item,
+        }
+    )
+
+    fake_llm_response = {
+        "output": {"message": {"content": [{"text": accumulated_text}]}},
+        "stopReason": stop_reason,
+        "usage": usage,
+    }
+    final_response = build_response(
+        body,
+        model=AGENT_MODEL,
+        llm_response=fake_llm_response,
+        response_id=response_id,
+        item_id=item_id,
+        created_at=created_at,
+    )
+    final_event_type = "response.incomplete" if is_truncated else "response.completed"
+    yield _sse(
+        {"type": final_event_type, "sequence_number": next_seq(), "response": final_response}
+    )
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post(f"{API_VERSION_PREFIX}/responses")
+@app.post(f"{API_VERSION_PREFIX}/responses", response_model=None)
 @limiter.limit("20/minute")
-def create_response(request: Request, body: CreateResponseRequest) -> dict:
+def create_response(request: Request, body: CreateResponseRequest) -> dict | StreamingResponse:
     # Auth Bearer real, antes de cualquier otro trabajo: sin el header
     # correcto, 401 sin tocar el LLM ni el resto de las validaciones. Nunca se
     # loguea el header Authorization ni el token (ni el valido ni el
@@ -248,8 +407,6 @@ def create_response(request: Request, body: CreateResponseRequest) -> dict:
         for item in body.input
     ):
         reject("El 'input' debe incluir al menos un mensaje con rol 'user' y contenido no vacio.")
-    if body.stream:
-        reject("Este agente no soporta stream=true.")
     if body.tools or body.tool_choice is not None:
         reject("Este agente no soporta tool calling.")
     if body.previous_response_id or body.conversation:
@@ -260,6 +417,14 @@ def create_response(request: Request, body: CreateResponseRequest) -> dict:
     _validate_input_items(body.input, instructions=body.instructions)
 
     messages = build_messages(body.instructions, body.input)
+
+    if body.stream:
+        return StreamingResponse(
+            _stream_response(body, messages),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
     try:
         llm_response = generate_reply(
             messages,
