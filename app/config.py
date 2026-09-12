@@ -11,6 +11,11 @@ API_VERSION_PREFIX = "/v1"
 # request publico se ignora.
 AGENT_MODEL = os.getenv("AGENT_MODEL", "us.anthropic.claude-haiku-4-5-20251001-v1:0")
 
-# Tope duro de tokens de salida por respuesta (paso 8): protege contra abuso de
-# costo via un max_output_tokens absurdamente alto en el request publico.
-MAX_OUTPUT_TOKENS_CAP = 2048
+# Tope duro de tokens de salida por respuesta (paso 8, bajado a 1024 en el
+# paso 9): protege contra abuso de costo via un max_output_tokens absurdamente
+# alto en el request publico.
+MAX_OUTPUT_TOKENS_CAP = 1024
+
+# Secreto del Bearer token real del endpoint (paso 9), mismo patron de nombre
+# que agent-cv/anthropic-api-key.
+BEARER_TOKEN_SECRET_NAME = "agent-cv/bearer-token"

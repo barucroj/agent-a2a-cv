@@ -24,6 +24,16 @@ primera vez hay que hacerlo en 2 fases:
 2. Build + push de la imagen a ECR (ver `Dockerfile`).
 3. `terraform apply` completo — ya con la imagen existente, crea el servicio.
 
+**Secretos requeridos antes de que la app pueda arrancar (paso 9):** la app lee el
+Bearer token real de Secrets Manager al importarse — si el secreto no existe, el
+contenedor falla al iniciar (ni siquiera sirve `/health`). Crearlo a mano, **fuera de
+Terraform** (igual que cualquier secreto del proyecto — así el valor nunca queda en el
+state):
+```
+aws secretsmanager create-secret --name agent-cv/bearer-token \
+  --secret-string "$(openssl rand -hex 32)" --profile agent-cv --region us-east-1
+```
+
 El `image` del contenedor se resuelve por **digest real** vía `data "aws_ecr_image"`
 (no por tag mutable), para no arriesgarse a desplegar un build viejo por accidente.
 
@@ -97,18 +107,56 @@ silenciosamente si `var.aws_region` cambiara alguna vez. Mismo bug de propagaci�
 prácticamente nunca cambia (a diferencia de `PUBLIC_BASE_URL`, que cambiaba en cada
 reemplazo).
 
-**Mitigación de costo puntual (no reemplaza el paso 9):** `/v1/responses` rechaza
-(400, antes de invocar Bedrock) si `instructions`+`input` combinados exceden 8,000
-caracteres, y el tope de `max_output_tokens` (2,048, ya validado desde el paso 2) ahora
-se aplica de verdad. Esto acota el costo de *una* request — **no hay autenticación, rate
-limiting ni cuota por llamador todavía**: cualquiera puede mandar muchos requests válidos
-y facturar Bedrock sin control. Es exactamente el riesgo #1 documentado desde el inicio
-del proyecto; se acepta temporalmente hasta el paso 9 (auth Bearer real, rate limiting,
-cuotas), que ya estaba planeado para esto.
+**Mitigación de costo puntual del paso 8 (superada por el paso 9, ver abajo):**
+`/v1/responses` rechazaba (400, antes de invocar Bedrock) si `instructions`+`input`
+combinados excedían 8,000 caracteres, y el tope de `max_output_tokens` (2,048) ya se
+aplicaba de verdad — pero sin autenticación ni rate limiting, cualquiera podía mandar
+muchos requests válidos y facturar Bedrock sin control (riesgo #1 documentado desde el
+inicio del proyecto). Resuelto en el paso 9.
 
 **Pendiente de limpieza (no urgente):** el secreto `agent-cv/anthropic-api-key` en
 Secrets Manager (creado en el intento #2 de arriba) ya no se usa — se deja sin borrar
 por ahora, sin costo real de mantenerlo.
+
+## Seguridad (paso 9)
+
+**Rate limiting: en la aplicación, no AWS WAF.** Se evaluó WAF (reglas rate-based) y se
+descartó por complejidad desproporcionada para el alcance de este proyecto — un recurso
+más para provisionar, configurar y mantener, cuando `slowapi` (librería en la propia app,
+`Limiter` de 20 requests/minuto por IP) resuelve el mismo problema con una dependencia y
+unas líneas de código. Queda como mejora futura posible si el proyecto necesitara
+protección a nivel de red (DDoS, reglas administradas), no como pendiente de este paso.
+- La IP real del llamador se obtiene del **último** valor de `X-Forwarded-For`, no el
+  primero: el ALB de ECS Express Mode usa el modo `append` (default, verificado contra
+  la documentación oficial de AWS) — agrega la IP real observada al final de cualquier
+  valor que el cliente ya haya mandado. Tomar el primer valor habría dejado el límite
+  evadible por cualquiera que mande su propio header (hallazgo real de `/codex:review`,
+  corregido antes de desplegar).
+- Storage en memoria (default de `slowapi`): correcto para una sola instancia
+  (`desiredCount=1`); si el servicio se escalara horizontalmente, haría falta un storage
+  compartido (ej. Redis).
+
+**CORS:** la plataforma externa consume `/v1/responses` servidor-a-servidor (backend a
+backend), nunca desde JavaScript en un navegador — CORS es un mecanismo que solo aplica
+el navegador (controla si su JS puede *leer* la respuesta de un fetch cross-origin), así
+que no afecta ese tráfico real. Se configuró en su forma más restrictiva posible
+(`allow_origins=[]`, ningún origen permitido) como defensa en profundidad, sin necesidad
+de whitelisting de orígenes.
+
+**Auth Bearer real:** el token vive en Secrets Manager (`agent-cv/bearer-token`, ver
+sección de infraestructura arriba) y se resuelve una sola vez al arrancar la app (mismo
+patrón que el resto de secretos del proyecto). Se compara con `hmac.compare_digest`
+(nunca `==`) para no filtrar el token por timing attack. Sin el header `Authorization:
+Bearer <token>` correcto, `/v1/responses` responde `401` antes de tocar el LLM o
+cualquier otra validación. El `securityScheme` que la agent card ya declaraba desde el
+paso 2 deja de ser aspiracional: el endpoint ahora sí lo exige.
+
+**Límites de tamaño/tokens, ya aplicados de verdad:**
+- `max_output_tokens`: tope absoluto de **1024** (bajado de 2048 en el paso 8) — cierra
+  el pendiente abierto desde el paso 2.
+- `input`+`instructions` combinados: tope de 8,000 caracteres, rechazado con **413**
+  (era 400 como parche del paso 8; se formalizó el código de estado en este paso) antes
+  de invocar el LLM.
 
 ## Limitaciones conocidas
 
@@ -146,13 +194,10 @@ por ahora, sin costo real de mantenerlo.
   URL real de Open Responses vive en el campo no estándar `x-openResponsesUrl` de la
   tarjeta; si la plataforma no lo lee automáticamente, hay que pegar la "URL base" a
   mano en su formulario de alta de agente.
-- El `securityScheme` de tipo Bearer declarado en la tarjeta describe la intención,
-  pero el endpoint `/responses` todavía no valida ningún token — la autenticación real
-  llega en el paso 9 del roadmap (rate limiting, validación de input, secretos). Esto es
-  aceptable como estado temporal de desarrollo, pero es una declaración aspiracional:
-  **pendiente explícito del paso 9** — confirmar que `/responses` efectivamente rechaza
-  requests sin Bearer token antes de cerrar el proyecto, para que la tarjeta deje de
-  declarar algo que el backend todavía no cumple.
+- **Resuelto en el paso 9:** el `securityScheme` de tipo Bearer que la agent card
+  declaraba desde el paso 2 era una declaración aspiracional (el endpoint no validaba
+  ningún token) — ya no lo es, `/v1/responses` ahora exige el Bearer real (ver sección
+  de Seguridad arriba).
 - El spec de A2A Agent Card tiene versiones incompatibles en el propio repo oficial
   (`a2aproject/A2A`, verificado directamente): la variante v0.3 usa un campo plano
   `url` + `protocolVersion` a nivel raíz, mientras que la variante v1.0 (rama `main`
